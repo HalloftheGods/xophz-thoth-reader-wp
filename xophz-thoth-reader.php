@@ -52,8 +52,16 @@ function xophz_thoth_reader_deactivate() {
 register_deactivation_hook( __FILE__, 'xophz_thoth_reader_deactivate' );
 
 function xophz_thoth_reader_action_links( $links ) {
+	foreach ( $links as $link ) {
+		if ( stripos( $link, '>Settings<' ) !== false ) {
+			return $links;
+		}
+	}
 	$settings_link = '<a href="options-general.php?page=xophz-thoth-reader">' . __( 'Settings', 'xophz-thoth-reader' ) . '</a>';
-	array_unshift( $links, $settings_link );
-	return $links;
+	$new_links     = array( 'settings' => $settings_link );
+	foreach ( $links as $key => $value ) {
+		$new_links[ $key ] = $value;
+	}
+	return $new_links;
 }
 add_filter( 'plugin_action_links_' . plugin_basename( __FILE__ ), 'xophz_thoth_reader_action_links' );
