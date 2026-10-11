@@ -14,6 +14,12 @@ class Thoth_Reader_API {
     const AI_WINDOW_SECONDS       = HOUR_IN_SECONDS;
     /** A Thoth deck is 78 cards; anything far above that is not a real reading. */
     const AI_MAX_CARDS            = 100;
+    /** Saved readings one user may write per window. Each save is a 30-day transient. */
+    const SAVE_MAX_PER_WINDOW     = 60;
+    /** Largest saved reading, as JSON. A full reading with its interpretation is far smaller. */
+    const SAVE_MAX_BYTES          = 65536;
+    /** Reading ids match the GET route's pattern. */
+    const SAVE_ID_PATTERN         = '/^[A-Za-z0-9_-]{1,64}$/';
 
     public function register_routes() {
         register_rest_route( 'thoth-reader/v1', '/health', array(
@@ -22,10 +28,11 @@ class Thoth_Reader_API {
             'permission_callback' => '__return_true',
         ) );
 
+        // Saving writes to the database, so it needs a logged-in user, a size cap and a per-user rate limit.
         register_rest_route( 'thoth-reader/v1', '/readings/save', array(
             'methods'             => WP_REST_Server::CREATABLE,
             'callback'            => array( $this, 'save_reading' ),
-            'permission_callback' => '__return_true',
+            'permission_callback' => array( $this, 'can_save_reading' ),
         ) );
 
         register_rest_route( 'thoth-reader/v1', '/readings/(?P<id>[a-zA-Z0-9_-]+)', array(
@@ -62,12 +69,35 @@ class Thoth_Reader_API {
     }
 
     /**
+     * Permission for saving a reading: any logged-in user, same as the AI routes.
+     */
+    public function can_save_reading() {
+        if ( is_user_logged_in() ) {
+            return true;
+        }
+
+        return new WP_Error( 'rest_forbidden', 'Log in to save a reading.', array( 'status' => 401 ) );
+    }
+
+    /**
      * Counts one Gemini call against the current user's hourly allowance.
      *
      * @return true|WP_Error WP_Error with status 429 once the allowance is spent.
      */
     private function consume_ai_allowance() {
-        $key   = 'thoth_ai_rate_' . get_current_user_id();
+        return $this->consume_allowance( 'thoth_ai_rate_', self::AI_MAX_CALLS_PER_WINDOW, 'Reading limit reached. Please try again later.' );
+    }
+
+    /**
+     * Counts one call against the current user's hourly allowance for one bucket.
+     *
+     * @param string $bucket  Transient prefix; the user id is appended.
+     * @param int    $max     Calls allowed per window.
+     * @param string $message Message for the 429 error.
+     * @return true|WP_Error WP_Error with status 429 once the allowance is spent.
+     */
+    private function consume_allowance( $bucket, $max, $message ) {
+        $key   = $bucket . get_current_user_id();
         $now   = time();
         $state = get_transient( $key );
 
@@ -79,10 +109,10 @@ class Thoth_Reader_API {
             );
         }
 
-        if ( $state['count'] >= self::AI_MAX_CALLS_PER_WINDOW ) {
+        if ( $state['count'] >= $max ) {
             return new WP_Error(
                 'rate_limited',
-                'Reading limit reached. Please try again later.',
+                $message,
                 array( 'status' => 429, 'retry_after' => $state['reset'] - $now )
             );
         }
@@ -101,17 +131,42 @@ class Thoth_Reader_API {
     }
 
     public function save_reading( WP_REST_Request $request ) {
-        $id           = sanitize_text_field( $request->get_param( 'id' ) );
+        $id           = (string) $request->get_param( 'id' );
         $reading_data = $request->get_param( 'readingData' );
 
-        if ( empty( $id ) || empty( $reading_data ) ) {
+        if ( '' === $id || empty( $reading_data ) ) {
             return new WP_Error( 'missing_params', 'Missing reading ID or data', array( 'status' => 400 ) );
         }
 
+        if ( ! preg_match( self::SAVE_ID_PATTERN, $id ) ) {
+            return new WP_Error( 'invalid_id', 'Reading ID may use only letters, digits, - and _ (64 at most).', array( 'status' => 400 ) );
+        }
+
+        if ( ! is_array( $reading_data ) ) {
+            return new WP_Error( 'invalid_reading', 'Reading data must be a JSON object.', array( 'status' => 400 ) );
+        }
+
+        $encoded = wp_json_encode( $reading_data );
+        if ( false === $encoded || strlen( $encoded ) > self::SAVE_MAX_BYTES ) {
+            return new WP_Error( 'reading_too_large', 'Reading data is too large to save.', array( 'status' => 413 ) );
+        }
+
+        $user_id       = get_current_user_id();
         $transient_key = 'thoth_reading_' . $id;
-        $payload       = array(
-            'readingData' => $reading_data,
+        $existing      = get_transient( $transient_key );
+        if ( is_array( $existing ) && isset( $existing['ownerId'] ) && (int) $existing['ownerId'] !== $user_id ) {
+            return new WP_Error( 'not_owner', 'Another account already saved a reading with this ID.', array( 'status' => 403 ) );
+        }
+
+        $allowance = $this->consume_allowance( 'thoth_save_rate_', self::SAVE_MAX_PER_WINDOW, 'Save limit reached. Please try again later.' );
+        if ( is_wp_error( $allowance ) ) {
+            return $allowance;
+        }
+
+        $payload = array(
+            'readingData' => json_decode( $encoded, true ),
             'createdAt'   => current_time( 'mysql' ),
+            'ownerId'     => $user_id,
         );
 
         set_transient( $transient_key, $payload, MONTH_IN_SECONDS );
@@ -129,6 +184,11 @@ class Thoth_Reader_API {
 
         if ( false === $reading ) {
             return new WP_Error( 'not_found', 'Reading not found or expired', array( 'status' => 404 ) );
+        }
+
+        // A shared reading link does not reveal which account saved it.
+        if ( is_array( $reading ) ) {
+            unset( $reading['ownerId'] );
         }
 
         return rest_ensure_response( array(
