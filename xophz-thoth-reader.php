@@ -19,6 +19,7 @@ define( 'XOPHZ_THOTH_READER_URL', plugin_dir_url( __FILE__ ) );
 
 require_once XOPHZ_THOTH_READER_PATH . 'admin/class-xophz-thoth-reader-admin.php';
 require_once XOPHZ_THOTH_READER_PATH . 'public/class-xophz-thoth-reader-public.php';
+require_once XOPHZ_THOTH_READER_PATH . 'includes/class-thoth-reader-connectors.php';
 require_once XOPHZ_THOTH_READER_PATH . 'includes/class-thoth-reader-api.php';
 
 function run_xophz_thoth_reader() {

@@ -9,6 +9,12 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 class Thoth_Reader_API {
 
+    /** Gemini calls one user may make per window, across both AI routes. */
+    const AI_MAX_CALLS_PER_WINDOW = 20;
+    const AI_WINDOW_SECONDS       = HOUR_IN_SECONDS;
+    /** A Thoth deck is 78 cards; anything far above that is not a real reading. */
+    const AI_MAX_CARDS            = 100;
+
     public function register_routes() {
         register_rest_route( 'thoth-reader/v1', '/health', array(
             'methods'             => WP_REST_Server::READABLE,
@@ -28,17 +34,63 @@ class Thoth_Reader_API {
             'permission_callback' => '__return_true',
         ) );
 
+        // Both routes spend the owner's Gemini key, so they need a logged-in user and a per-user rate limit.
         register_rest_route( 'thoth-reader/v1', '/reading/interpret', array(
             'methods'             => WP_REST_Server::CREATABLE,
             'callback'            => array( $this, 'interpret_reading' ),
-            'permission_callback' => '__return_true',
+            'permission_callback' => array( $this, 'can_use_ai' ),
         ) );
 
         register_rest_route( 'thoth-reader/v1', '/reading/synthesize-narrative', array(
             'methods'             => WP_REST_Server::CREATABLE,
             'callback'            => array( $this, 'synthesize_narrative' ),
-            'permission_callback' => '__return_true',
+            'permission_callback' => array( $this, 'can_use_ai' ),
         ) );
+    }
+
+    /**
+     * Permission for the routes that call Gemini: any logged-in user. The page shell hands a
+     * logged-in visitor an X-WP-Nonce (window.wpApiSettings.nonce), which core's cookie
+     * authentication checks before this runs.
+     */
+    public function can_use_ai() {
+        if ( is_user_logged_in() ) {
+            return true;
+        }
+
+        return new WP_Error( 'rest_forbidden', 'Log in to request a reading.', array( 'status' => 401 ) );
+    }
+
+    /**
+     * Counts one Gemini call against the current user's hourly allowance.
+     *
+     * @return true|WP_Error WP_Error with status 429 once the allowance is spent.
+     */
+    private function consume_ai_allowance() {
+        $key   = 'thoth_ai_rate_' . get_current_user_id();
+        $now   = time();
+        $state = get_transient( $key );
+
+        $is_window_open = is_array( $state ) && isset( $state['count'], $state['reset'] ) && $state['reset'] > $now;
+        if ( ! $is_window_open ) {
+            $state = array(
+                'count' => 0,
+                'reset' => $now + self::AI_WINDOW_SECONDS,
+            );
+        }
+
+        if ( $state['count'] >= self::AI_MAX_CALLS_PER_WINDOW ) {
+            return new WP_Error(
+                'rate_limited',
+                'Reading limit reached. Please try again later.',
+                array( 'status' => 429, 'retry_after' => $state['reset'] - $now )
+            );
+        }
+
+        $state['count']++;
+        set_transient( $key, $state, max( 1, $state['reset'] - $now ) );
+
+        return true;
     }
 
     public function health_check() {
@@ -86,20 +138,7 @@ class Thoth_Reader_API {
     }
 
     private function get_gemini_key() {
-        if ( function_exists( 'wp_get_connectors' ) ) {
-            $connectors = wp_get_connectors();
-            if ( ! empty( $connectors['google']['authentication']['setting_name'] ) ) {
-                $api_key = get_option( $connectors['google']['authentication']['setting_name'], '' );
-                if ( ! empty( $api_key ) ) {
-                    return $api_key;
-                }
-            }
-        }
-        $key = getenv( 'GEMINI_API_KEY' );
-        if ( empty( $key ) && defined( 'GEMINI_API_KEY' ) ) {
-            $key = GEMINI_API_KEY;
-        }
-        return $key;
+        return Thoth_Reader_Connectors::get_key( 'google' );
     }
 
     private function get_gemini_model() {
@@ -118,11 +157,11 @@ class Thoth_Reader_API {
     private function call_gemini( $prompt ) {
         $api_key = $this->get_gemini_key();
         if ( empty( $api_key ) ) {
-            return new WP_Error( 'no_api_key', 'GEMINI_API_KEY is not configured.', array( 'status' => 500 ) );
+            return new WP_Error( 'no_api_key', 'The Google Gemini key is not configured. Add it in Settings > Connectors.', array( 'status' => 500 ) );
         }
 
         $model = $this->get_gemini_model();
-        $url  = 'https://generativelanguage.googleapis.com/v1beta/models/' . $model . ':generateContent?key=' . $api_key;
+        $url   = 'https://generativelanguage.googleapis.com/v1beta/models/' . $model . ':generateContent';
         $body = array(
             'contents'         => array(
                 array(
@@ -138,8 +177,9 @@ class Thoth_Reader_API {
 
         $response = wp_remote_post( $url, array(
             'headers'     => array(
-                'Content-Type' => 'application/json',
-                'User-Agent'   => 'aistudio-build',
+                'Content-Type'   => 'application/json',
+                'User-Agent'     => 'aistudio-build',
+                'x-goog-api-key' => $api_key,
             ),
             'body'        => wp_json_encode( $body ),
             'method'      => 'POST',
@@ -179,6 +219,10 @@ class Thoth_Reader_API {
             return new WP_Error( 'missing_cards', 'No cards provided for interpretation.', array( 'status' => 400 ) );
         }
 
+        if ( count( $pulled_cards ) > self::AI_MAX_CARDS ) {
+            return new WP_Error( 'too_many_cards', 'Too many cards for one reading.', array( 'status' => 400 ) );
+        }
+
         $card_summary_list = implode( "\n\n", array_map( function( $card, $idx ) {
             return sprintf(
                 "Step %d: [%s] (%s)\n  - Category: %s | Numerology Count: %s\n  - Hebrew Letter: %s\n  - Astrological Attribution: %s\n  - Alchemical Element/Process: %s\n  - Tree of Life: %s\n  - Occult Key Themes: %s",
@@ -201,6 +245,11 @@ class Thoth_Reader_API {
             $question ? $question : 'General Spiritual & Alchemical Guidance for the Querent'
         );
 
+        $allowance = $this->consume_ai_allowance();
+        if ( is_wp_error( $allowance ) ) {
+            return $allowance;
+        }
+
         $result = $this->call_gemini( $prompt );
         if ( is_wp_error( $result ) ) {
             return $result;
@@ -221,6 +270,10 @@ class Thoth_Reader_API {
             return new WP_Error( 'missing_cards', 'No cards provided for narrative synthesis.', array( 'status' => 400 ) );
         }
 
+        if ( count( $pulled_cards ) > self::AI_MAX_CARDS ) {
+            return new WP_Error( 'too_many_cards', 'Too many cards for one reading.', array( 'status' => 400 ) );
+        }
+
         $card_names = implode( ' -> ', array_map( function( $c ) { return isset( $c['name'] ) ? $c['name'] : ''; }, $pulled_cards ) );
 
         $prompt = sprintf(
@@ -229,6 +282,11 @@ class Thoth_Reader_API {
             $card_names,
             $style ? $style : 'crowleyan'
         );
+
+        $allowance = $this->consume_ai_allowance();
+        if ( is_wp_error( $allowance ) ) {
+            return $allowance;
+        }
 
         $result = $this->call_gemini( $prompt );
         if ( is_wp_error( $result ) ) {
