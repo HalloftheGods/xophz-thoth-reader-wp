@@ -3,7 +3,8 @@
  * Plugin Name:       Xophz Thoth Reader
  * Description:       Standalone WordPress backend, router, and REST API for the Svelte 5 Thoth Reader web app.
  * Version:           26.7.30
- * Author:            Hall of the Gods, Inc.
+ * Author:            My Compass Consulting
+ * Author URI:        https://mycompassconsulting.com/
  * Category:          Command Deck
  * Group:             Ecosystem
  * Text Domain:       xophz-thoth-reader
